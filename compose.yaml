@@ -1,0 +1,29 @@
+services:
+  app:
+    image: ${APP_IMAGE:-college-report-mvp:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    environment:
+      APP_DATA_DIR: /app/data
+      REPORT_STUDENT: ${REPORT_STUDENT:-}
+      REPORT_SPECIALTY: ${REPORT_SPECIALTY:-}
+      REPORT_GROUP: ${REPORT_GROUP:-}
+      REPORT_TEACHER: ${REPORT_TEACHER:-}
+      REPORT_CITY: ${REPORT_CITY:-}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/reports', timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

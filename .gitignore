@@ -1,0 +1,22 @@
+# Local configuration and reports
+.env
+!.env.example
+.docker-config/
+/data/
+/backend/data/
+
+# Python
+.venv/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.uv-cache/
+.pytest-error.txt
+
+# JavaScript
+**/node_modules/
+**/dist/
+**/.npm-cache/
+
+# Local analysis artifacts
+/cover_structure.txt

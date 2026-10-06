@@ -1,0 +1,1 @@
+{"name":"report-forms","version":"0.1.0","private":true,"type":"module","scripts":{"dev":"vite --host 127.0.0.1","build":"tsc --noEmit && vite build"},"dependencies":{"@vitejs/plugin-react":"latest","lucide-react":"^0.468.0","react":"latest","react-dom":"latest","typescript":"latest","vite":"latest"},"devDependencies":{"@types/react":"^19.3.0","@types/react-dom":"^19.3.0"}}

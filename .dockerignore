@@ -1,0 +1,17 @@
+.git
+.github
+.env
+.docker-config
+.venv
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.uv-cache
+**/node_modules
+**/dist
+backend/data
+data
+*.sqlite
+*.sqlite3
+*.db
+*.odt~
