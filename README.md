@@ -2,37 +2,84 @@
 
 Локальное приложение для заполнения структурированных отчётов и экспорта в ODT по шаблону колледжа.
 
-## Запуск через Docker Compose
+## Запуск через Docker Compose (Linux)
 
-Нужен Docker Desktop с Compose v2. Скопируйте `.env.example` в `.env`, укажите данные студента и запустите из корня репозитория:
+Нужны Docker Engine и Docker Compose v2. Из корня репозитория:
 
-```powershell
-Copy-Item .env.example .env
-# Отредактируйте .env: REPORT_STUDENT, REPORT_SPECIALTY, REPORT_GROUP, REPORT_TEACHER, REPORT_CITY
+```bash
+cp .env.example .env
+nano .env  # задайте REPORT_STUDENT, REPORT_SPECIALTY, REPORT_GROUP, REPORT_TEACHER и REPORT_CITY
 docker compose up -d --build
 ```
 
-Откройте <http://localhost:8000>. Compose собирает React-интерфейс и FastAPI в один контейнер. SQLite, загруженные файлы и экспорты сохраняются в локальном каталоге `./data`; данные переживают пересборку контейнера. Для резервной копии остановите приложение и скопируйте этот каталог.
+Откройте <http://localhost:8000>. Compose собирает React-интерфейс и FastAPI в один контейнер. SQLite, загруженные файлы и экспорты сохраняются в `./data`; они переживают пересборку контейнера. Для резервной копии остановите приложение (`docker compose down`) и скопируйте этот каталог.
 
-Переменные профиля применяются только при первом создании базы. В уже существующей базе они не перезаписывают профиль. Его можно обновить через `PATCH /api/profile`, например:
+Если хотите запустить уже опубликованный образ из GHCR, укажите его в `.env`:
 
-```powershell
-Invoke-RestMethod http://localhost:8000/api/profile -Method Patch -ContentType 'application/json' -Body '{"student":"Фамилия И.О.","specialty":"Специальность","group_name":"ГРУППА-1","teacher":"Преподаватель И.О.","city":"Город"}'
+```dotenv
+APP_IMAGE=ghcr.io/natimys/report-automation:latest
 ```
 
-## Локальная разработка без Docker
+Затем выполните:
 
-Окно PowerShell 1:
+```bash
+docker compose pull
+docker compose up -d --no-build
+```
+
+Для получения образа без авторизации его пакет GHCR должен иметь видимость **Public**.
+
+Профильные переменные применяются только при первом создании базы. В существующей базе они профиль не перезаписывают. Изменить профиль можно через API:
+
+```bash
+curl -X PATCH http://localhost:8000/api/profile \
+  -H 'Content-Type: application/json' \
+  -d '{"student":"Фамилия И.О.","specialty":"Специальность","group_name":"ГРУППА-1","teacher":"Преподаватель И.О.","city":"Город"}'
+```
+
+## Windows PowerShell
+
+В PowerShell из корня репозитория:
 
 ```powershell
+Copy-Item .env.example .env
+notepad .env  # задайте REPORT_STUDENT, REPORT_SPECIALTY, REPORT_GROUP, REPORT_TEACHER и REPORT_CITY
+docker compose up -d --build
+```
+
+Откройте <http://localhost:8000>. Чтобы запустить опубликованный образ, добавьте в `.env` строку `APP_IMAGE=ghcr.io/natimys/report-automation:latest`, затем выполните:
+
+```powershell
+docker compose pull
+docker compose up -d --no-build
+```
+
+Профиль можно изменить через API:
+
+```powershell
+$body = @{
+  student = 'Фамилия И.О.'
+  specialty = 'Специальность'
+  group_name = 'ГРУППА-1'
+  teacher = 'Преподаватель И.О.'
+  city = 'Город'
+} | ConvertTo-Json
+Invoke-RestMethod http://localhost:8000/api/profile -Method Patch -ContentType 'application/json' -Body $body
+```
+
+## Локальная разработка без Docker (Linux)
+
+В первом терминале:
+
+```bash
 cd backend
 uv sync
 uv run uvicorn app.main:app --reload
 ```
 
-Окно PowerShell 2:
+Во втором терминале:
 
-```powershell
+```bash
 cd frontend
 npm ci
 npm run dev
@@ -40,25 +87,38 @@ npm run dev
 
 Откройте <http://127.0.0.1:5173>. Vite проксирует `/api` к FastAPI на порту 8000.
 
-## Проверки
+## Локальная разработка в Windows PowerShell
+
+Терминал 1:
 
 ```powershell
-cd backend
-uv run pytest
-cd ../frontend
-npm run build
+Set-Location backend
+uv sync
+uv run uvicorn app.main:app --reload
 ```
 
-GitHub Actions выполняет эти проверки и собирает контейнер. Пуш в `main` публикует `ghcr.io/<владелец>/report-automation:latest`. Тег версии `v1.2.3` публикует версионный образ и создаёт GitHub Release.
-
-Чтобы запустить опубликованный образ, задайте `APP_IMAGE=ghcr.io/<владелец>/report-automation:latest` в `.env`, затем выполните:
+Терминал 2:
 
 ```powershell
-docker compose pull
-docker compose up -d --no-build
+Set-Location frontend
+npm ci
+npm run dev
 ```
 
-После первой публикации образа откройте его Package settings на GitHub и установите видимость **Public**, если он должен загружаться без авторизации.
+Откройте <http://127.0.0.1:5173>.
+
+## Проверки и публикация
+
+Локальные проверки (Linux):
+
+```bash
+cd backend && uv run pytest
+cd ../frontend && npm ci && npm run build
+```
+
+GitHub Actions выполняет тесты, собирает и отправляет контейнер в GHCR. Пуш в `main` публикует `ghcr.io/natimys/report-automation:latest`. Пуш тега версии вида `v1.2.3` публикует версионный образ и создаёт GitHub Release. Обычный запуск workflow для `main` помечает job `release` как skipped — release создаётся только при событии с тегом `v*`. Для успешного создания release сначала должна успешно завершиться публикация образа.
+
+Сейчас workflow собирает `linux/amd64` на штатном GitHub runner. Попытка собрать `linux/arm64` через QEMU завершалась `SIGILL` при выполнении `npm ci`; arm64 добавим после настройки нативного ARM runner.
 
 ## Данные
 
