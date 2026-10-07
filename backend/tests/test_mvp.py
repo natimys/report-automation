@@ -21,8 +21,8 @@ def client(tmp_path,monkeypatch):
     with TestClient(app) as test_client:yield test_client
     test_db.dispose()
 
-def png(color):
-    im=Image.new("RGB",(32,24),color)
+def png(color,size=(1920,1080)):
+    im=Image.new("RGB",size,color)
     b=io.BytesIO();im.save(b,format="PNG");return b.getvalue()
 
 def test_end_to_end_export_and_figure_order(client):
@@ -89,6 +89,10 @@ def test_end_to_end_export_and_figure_order(client):
     body_style=styles[ordinary.get('{%s}style-name'%ns['text'])]
     assert body_style.find('{%s}text-properties'%ns['style']).get('{%s}font-size'%ns['fo'])=='12pt'
     assert 'content.xml' in z.namelist() and len([n for n in z.namelist() if n.startswith('Pictures/')])==3
+    frames=xml.xpath('//draw:frame',namespaces={'draw':'urn:oasis:names:tc:opendocument:xmlns:drawing:1.0','svg':'urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0'})
+    assert len(frames)==3
+    assert frames[0].get('{urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0}width')=='6.00in'
+    assert frames[0].get('{urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0}height')=='3.38in'
     serialized=etree.tostring(xml,encoding='utf-8');assert all(f'Рис {n}'.encode() in serialized for n in (1,2,3))
 
 def test_export_rejects_invalid_report(client):

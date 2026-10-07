@@ -444,9 +444,16 @@ def export_report_to_odt(r:Report,subject:Subject, path:Path):
             try:
                 from PIL import Image
                 from io import BytesIO
-                im=Image.open(BytesIO(raw));width,height=im.size
-                factor=min(1.0, 6.0/width, 7.0/height);width*=factor;height*=factor
-                width_in=f"{width/96:.2f}in";height_in=f"{height/96:.2f}in"
+                im=Image.open(BytesIO(raw));pixel_width,pixel_height=im.size
+                # ODT frame extents are physical lengths, while Pillow reports
+                # raster dimensions in pixels. Convert at the usual 96 DPI first,
+                # then constrain the physical size to the page's usable area.
+                # Applying the inch limits directly to pixel counts made ordinary
+                # screenshots render at only a few hundredths of an inch.
+                width_in_value=pixel_width/96
+                height_in_value=pixel_height/96
+                factor=min(1.0, 6.0/width_in_value, 7.0/height_in_value)
+                width_in=f"{width_in_value*factor:.2f}in";height_in=f"{height_in_value*factor:.2f}in"
             except Exception:width_in="4.00in";height_in="3.00in"
             frame=etree.SubElement(imagepara,"{%s}frame"%NS["draw"]);frame.set("{%s}name"%NS["draw"],f"Figure{fnum}");frame.set("{%s}anchor-type"%NS["text"],"paragraph");frame.set("{%s}width"%NS["svg"],width_in);frame.set("{%s}height"%NS["svg"],height_in)
             img=etree.SubElement(frame,"{%s}image"%NS["draw"]);img.set("{%s}href"%NS["xlink"],image_name);img.set("{%s}type"%NS["xlink"],"simple");img.set("{%s}show"%NS["xlink"],"embed");img.set("{%s}actuate"%NS["xlink"],"onLoad")
