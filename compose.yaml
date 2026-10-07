@@ -13,6 +13,7 @@ services:
       REPORT_GROUP: ${REPORT_GROUP:-}
       REPORT_TEACHER: ${REPORT_TEACHER:-}
       REPORT_CITY: ${REPORT_CITY:-}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
@@ -22,7 +23,7 @@ services:
         - CMD
         - python
         - -c
-        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/reports', timeout=3)
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/auth/me', timeout=3)
       interval: 30s
       timeout: 5s
       retries: 3

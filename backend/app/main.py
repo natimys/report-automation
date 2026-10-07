@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import mimetypes
+import hashlib
+import hmac
 import os
+import secrets
 import shutil
 import uuid
 import zipfile
 from datetime import datetime
+from datetime import timedelta
+from getpass import getpass
 from pathlib import Path
 from typing import Any
+import argparse
+from contextvars import ContextVar
 
-from fastapi import FastAPI, File as UploadFile, HTTPException, Response, UploadFile as IncomingFile
+from fastapi import Depends, FastAPI, File as UploadFile, HTTPException, Request, Response, UploadFile as IncomingFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 from lxml import etree
 
@@ -25,6 +32,18 @@ DB = create_engine(f"sqlite:///{(DATA / 'reports.sqlite3').as_posix()}", connect
 DATA.mkdir(exist_ok=True)
 
 class Base(DeclarativeBase): pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    login: Mapped[str] = mapped_column(String, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String)
+
+class LoginSession(Base):
+    __tablename__ = "login_sessions"
+    token_hash: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 class Subject(Base):
     __tablename__ = "subjects"
@@ -40,10 +59,12 @@ class Profile(Base):
     group_name: Mapped[str] = mapped_column(String, default="")
     teacher: Mapped[str] = mapped_column(String, default="")
     city: Mapped[str] = mapped_column(String, default="")
+    owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
 
 class Report(Base):
     __tablename__ = "reports"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     title: Mapped[str] = mapped_column(String, default="")
     subject_id: Mapped[str | None] = mapped_column(ForeignKey("subjects.id"), nullable=True)
     work_number: Mapped[str] = mapped_column(String, default="")
@@ -96,6 +117,19 @@ class StepAttachment(Base):
 
 DATA.mkdir(parents=True, exist_ok=True)
 Base.metadata.create_all(DB)
+# Add ownership to databases created by older versions without losing reports.
+with DB.begin() as _conn:
+    _tables = {row[0] for row in _conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
+    if "reports" in _tables:
+        _columns = {row[1] for row in _conn.execute(text("PRAGMA table_info(reports)"))}
+        if "owner_id" not in _columns:
+            _conn.execute(text("ALTER TABLE reports ADD COLUMN owner_id VARCHAR REFERENCES users(id) ON DELETE CASCADE"))
+        _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_reports_owner_id ON reports(owner_id)"))
+    if "profile" in _tables:
+        _columns = {row[1] for row in _conn.execute(text("PRAGMA table_info(profile)"))}
+        if "owner_id" not in _columns:
+            _conn.execute(text("ALTER TABLE profile ADD COLUMN owner_id VARCHAR REFERENCES users(id) ON DELETE CASCADE"))
+        _conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_profile_owner_id ON profile(owner_id)"))
 with Session(DB) as _seed:
     if not _seed.scalar(select(Subject)):
         _seed.add_all([Subject(name="Операционные системы и среды"), Subject(name="Технологии обработки информации")])
@@ -109,7 +143,115 @@ with Session(DB) as _seed:
             city=os.getenv("REPORT_CITY", "")))
         _seed.commit()
 app = FastAPI(title="Практические работы")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+request_user: ContextVar[User | None] = ContextVar("request_user", default=None)
+
+PASSWORD_ITERATIONS = 310_000
+SESSION_DAYS = 14
+COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true"
+
+def password_digest(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${key.hex()}"
+
+def check_password(password: str, encoded: str) -> bool:
+    try:
+        scheme, iterations, salt, expected = encoded.split("$")
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(iterations)).hex()
+        return scheme == "pbkdf2_sha256" and hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+DUMMY_PASSWORD_HASH = password_digest("not-a-real-password")
+
+def current_user(request: Request) -> User | None:
+    token = request.cookies.get("report_session")
+    if not token:
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with Session(DB) as s:
+        session = s.get(LoginSession, token_hash)
+        if not session or session.expires_at <= datetime.utcnow():
+            if session:
+                s.delete(session); s.commit()
+            return None
+        return s.get(User, session.user_id)
+
+@app.middleware("http")
+async def auth_gate(request: Request, call_next):
+    public_paths = {"/api/auth/login", "/api/auth/logout", "/api/auth/me"}
+    if request.url.path.startswith("/api/") and request.url.path not in public_paths and request.method != "OPTIONS":
+        user = current_user(request)
+        if not user:
+            return JSONResponse({"detail": "Войдите в систему"}, status_code=401)
+        token = request_user.set(user)
+        try:
+            return await call_next(request)
+        finally:
+            request_user.reset(token)
+    return await call_next(request)
+
+def owner_id() -> str:
+    user = request_user.get()
+    if not user:
+        raise HTTPException(401, "Войдите в систему")
+    return user.id
+
+@app.get("/api/auth/me")
+def auth_me(user: User | None = Depends(current_user)):
+    return {"authenticated": bool(user), "login": user.login if user else None}
+
+class LoginInput(BaseModel):
+    login: str
+    password: str
+
+@app.post("/api/auth/login")
+def auth_login(data: LoginInput, response: Response):
+    login = data.login.strip()
+    with Session(DB) as s:
+        user = s.scalar(select(User).where(User.login == login))
+        # Check a dummy hash for unknown accounts too, so login timing does not reveal registered names.
+        valid = check_password(data.password, user.password_hash if user else DUMMY_PASSWORD_HASH)
+        if not user or not valid:
+            raise HTTPException(401, "Неверный логин или пароль")
+        token = secrets.token_urlsafe(32)
+        s.add(LoginSession(token_hash=hashlib.sha256(token.encode()).hexdigest(), user_id=user.id, expires_at=datetime.utcnow()+timedelta(days=SESSION_DAYS)))
+        s.commit()
+        response.set_cookie("report_session", token, httponly=True, secure=COOKIE_SECURE, samesite="lax", max_age=SESSION_DAYS*24*60*60, path="/")
+        return {"authenticated": True, "login": user.login}
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response):
+    token = request.cookies.get("report_session")
+    if token:
+        with Session(DB) as s:
+            session = s.get(LoginSession, hashlib.sha256(token.encode()).hexdigest())
+            if session:
+                s.delete(session); s.commit()
+    response.delete_cookie("report_session", path="/", httponly=True, secure=COOKIE_SECURE, samesite="lax")
+    return {"ok": True}
+
+def register_user(login: str, password: str) -> None:
+    normalized = login.strip()
+    if not normalized or len(normalized) > 80:
+        raise ValueError("Логин должен содержать от 1 до 80 символов")
+    if len(password) < 8:
+        raise ValueError("Пароль должен содержать не менее 8 символов")
+    with Session(DB) as s:
+        existing_users = s.scalar(select(User.id).limit(1))
+        if s.scalar(select(User).where(User.login == normalized)):
+            raise ValueError("Пользователь с таким логином уже существует")
+        user = User(login=normalized, password_hash=password_digest(password))
+        s.add(user); s.flush()
+        if not existing_users:
+            # Preserve pre-authentication reports and profile for the first registered account.
+            for report in s.scalars(select(Report).where(Report.owner_id.is_(None))):
+                report.owner_id = user.id
+            legacy_profile = s.scalar(select(Profile).where(Profile.owner_id.is_(None)).order_by(Profile.id).limit(1))
+            if legacy_profile:
+                legacy_profile.owner_id = user.id
+        s.commit()
 
 class SubjectInput(BaseModel): name: str; teacher: str = ""
 class ReportInput(BaseModel): subject_id: str | None = None; work_number: str = ""; year: str = str(datetime.now().year); goal: str = ""; equipment: str = "Компьютер с ОС Windows 11"; auto_conclusion: bool = True; conclusion: str = ""; title: str = ""
@@ -120,8 +262,23 @@ class AttachInput(BaseModel): file_id: str
 
 def get_report(s: Session, rid: str) -> Report:
     r=s.get(Report,rid)
-    if not r: raise HTTPException(404,"Отчёт не найден")
+    if not r or r.owner_id != owner_id(): raise HTTPException(404,"Отчёт не найден")
     return r
+
+def get_task(s: Session, tid: str) -> Task:
+    item=s.get(Task,tid)
+    if not item or item.report.owner_id != owner_id(): raise HTTPException(404,"Задание не найдено")
+    return item
+
+def get_step(s: Session, sid: str) -> Step:
+    item=s.get(Step,sid)
+    if not item or item.task.report.owner_id != owner_id(): raise HTTPException(404,"Шаг не найден")
+    return item
+
+def get_file(s: Session, fid: str) -> File:
+    item=s.get(File,fid)
+    if not item or item.report.owner_id != owner_id(): raise HTTPException(404,"Файл не найден")
+    return item
 
 def figure_map(r: Report) -> dict[str,int]:
     out={}
@@ -160,7 +317,7 @@ def del_subject(sid:str):
 @app.get("/api/reports")
 def reports():
     with Session(DB) as s:
-        rows=s.scalars(select(Report).order_by(Report.updated_at.desc())).all()
+        rows=s.scalars(select(Report).where(Report.owner_id==owner_id()).order_by(Report.updated_at.desc())).all()
         return [{"id":r.id,"work_number":r.work_number,"year":r.year,"subject":s.get(Subject,r.subject_id).name if r.subject_id and s.get(Subject,r.subject_id) else "—","updated_at":r.updated_at.isoformat(),"completion":completion(r)} for r in rows]
 def completion(r:Report):
     checks=[bool(r.subject_id),bool(r.work_number.strip()),bool(r.year.strip()),bool(r.goal.strip()),bool(r.equipment.strip()),bool(r.tasks) and all(t.text.strip() and t.steps and all(st.text.strip() for st in t.steps) for t in r.tasks),bool(r.auto_conclusion or r.conclusion.strip())]
@@ -168,7 +325,7 @@ def completion(r:Report):
 @app.post("/api/reports")
 def create_report():
     with Session(DB) as s:
-        r=Report();s.add(r);s.flush();t=Task(report_id=r.id,position=0);s.add(t);s.flush();s.add(Step(task_id=t.id,position=0));s.commit();s.refresh(r);return report_json(r,s)
+        r=Report(owner_id=owner_id());s.add(r);s.flush();t=Task(report_id=r.id,position=0);s.add(t);s.flush();s.add(Step(task_id=t.id,position=0));s.commit();s.refresh(r);return report_json(r,s)
 @app.get("/api/reports/{rid}")
 def read_report(rid:str):
     with Session(DB) as s:return report_json(get_report(s,rid),s)
@@ -191,21 +348,19 @@ def add_task(rid:str,data:TaskInput=TaskInput()):
 @app.patch("/api/tasks/{tid}")
 def patch_task(tid:str,data:TaskInput):
     with Session(DB) as s:
-        t=s.get(Task,tid)
-        if not t:raise HTTPException(404,"Задание не найдено")
+        t=get_task(s,tid)
         t.text=data.text;t.report.updated_at=datetime.utcnow();s.commit();return {"ok":True}
 @app.delete("/api/tasks/{tid}",status_code=204)
 def del_task(tid:str):
     with Session(DB) as s:
-        t=s.get(Task,tid)
-        if not t:raise HTTPException(404,"Задание не найдено")
+        t=get_task(s,tid)
         rid=t.report_id;pos=t.position;s.delete(t);s.flush()
         for i,x in enumerate(s.scalars(select(Task).where(Task.report_id==rid).order_by(Task.position)).all()):x.position=i
         s.get(Report,rid).updated_at=datetime.utcnow();s.commit();return Response(status_code=204)
 @app.post("/api/tasks/reorder")
 def reorder_tasks(data:OrderInput):
     with Session(DB) as s:
-        items=[s.get(Task,i) for i in data.ids]
+        items=[get_task(s,i) for i in data.ids]
         if any(x is None for x in items) or len({x.report_id for x in items})>1:raise HTTPException(400,"Неверный порядок заданий")
         for i,x in enumerate(items):x.position=i
         if items:items[0].report.updated_at=datetime.utcnow()
@@ -213,27 +368,24 @@ def reorder_tasks(data:OrderInput):
 @app.post("/api/tasks/{tid}/steps")
 def add_step(tid:str,data:StepInput=StepInput()):
     with Session(DB) as s:
-        t=s.get(Task,tid)
-        if not t:raise HTTPException(404,"Задание не найдено")
+        t=get_task(s,tid)
         st=Step(task_id=tid,text=data.text,position=len(t.steps));s.add(st);t.report.updated_at=datetime.utcnow();s.commit();return {"id":st.id}
 @app.patch("/api/steps/{sid}")
 def patch_step(sid:str,data:StepInput):
     with Session(DB) as s:
-        st=s.get(Step,sid)
-        if not st:raise HTTPException(404,"Шаг не найден")
+        st=get_step(s,sid)
         st.text=data.text;st.task.report.updated_at=datetime.utcnow();s.commit();return {"ok":True}
 @app.delete("/api/steps/{sid}",status_code=204)
 def del_step(sid:str):
     with Session(DB) as s:
-        st=s.get(Step,sid)
-        if not st:raise HTTPException(404,"Шаг не найден")
+        st=get_step(s,sid)
         tid=st.task_id;rid=st.task.report_id;s.delete(st);s.flush()
         for i,x in enumerate(s.scalars(select(Step).where(Step.task_id==tid).order_by(Step.position)).all()):x.position=i
         s.get(Report,rid).updated_at=datetime.utcnow();s.commit();return Response(status_code=204)
 @app.post("/api/steps/reorder")
 def reorder_steps(data:OrderInput):
     with Session(DB) as s:
-        items=[s.get(Step,i) for i in data.ids]
+        items=[get_step(s,i) for i in data.ids]
         if any(x is None for x in items) or len({x.task_id for x in items})>1:raise HTTPException(400,"Неверный порядок шагов")
         for i,x in enumerate(items):x.position=i
         if items:items[0].task.report.updated_at=datetime.utcnow()
@@ -258,23 +410,21 @@ async def upload(rid:str,file:IncomingFile=UploadFile(...)):
 @app.get("/api/files/{fid}/content")
 def content(fid:str):
     with Session(DB) as s:
-        f=s.get(File,fid)
-        if not f:raise HTTPException(404,"Файл не найден")
+        f=get_file(s,fid)
         path=DATA/"reports"/f.report_id/"files"/f.stored_name
         if not path.is_file():raise HTTPException(404,"Файл отсутствует на диске")
         return FileResponse(path,media_type=f.mime_type)
 @app.delete("/api/files/{fid}")
 def delete_file(fid:str):
     with Session(DB) as s:
-        f=s.get(File,fid)
-        if not f:raise HTTPException(404,"Файл не найден")
+        f=get_file(s,fid)
         used=s.scalar(select(StepAttachment).where(StepAttachment.file_id==fid))
         if used:raise HTTPException(409,"Сначала открепите изображение от шагов")
         path=DATA/"reports"/f.report_id/"files"/f.stored_name;s.delete(f);s.commit();path.unlink(missing_ok=True);return {"ok":True}
 @app.post("/api/steps/{sid}/attachments")
 def attach(sid:str,data:AttachInput):
     with Session(DB) as s:
-        st=s.get(Step,sid);f=s.get(File,data.file_id)
+        st=get_step(s,sid);f=get_file(s,data.file_id)
         if not st or not f:raise HTTPException(404,"Шаг или файл не найден")
         if st.task.report_id!=f.report_id:raise HTTPException(400,"Файл относится к другому отчёту")
         if not s.get(StepAttachment,(sid,f.id)):s.add(StepAttachment(step_id=sid,file_id=f.id,position=len(st.attachments)))
@@ -282,6 +432,7 @@ def attach(sid:str,data:AttachInput):
 @app.delete("/api/steps/{sid}/attachments/{fid}",status_code=204)
 def detach(sid:str,fid:str):
     with Session(DB) as s:
+        st=get_step(s,sid)
         a=s.get(StepAttachment,(sid,fid))
         if not a:raise HTTPException(404,"Связь не найдена")
         a.step.task.report.updated_at=datetime.utcnow();s.delete(a);s.commit();return Response(status_code=204)
@@ -378,7 +529,7 @@ def export_report_to_odt(r:Report,subject:Subject, path:Path):
         # Replace only the variable text runs; preserve each template style/span.
         cover=[]
         with Session(DB) as profile_db:
-            profile=profile_db.get(Profile,1)
+            profile=profile_db.scalar(select(Profile).where(Profile.owner_id==owner_id()))
             identity=(profile.student,profile.specialty,profile.group_name,subject.teacher or profile.teacher,profile.city) if profile else ("","","",subject.teacher or "","")
         cover_styles={
             "P4":["ОТЧЁТ по практической работе № ",r.work_number],
@@ -479,19 +630,23 @@ def export(rid:str):
     with Session(DB) as s:
         r=get_report(s,rid);errors=validate_report(r)
         if errors:raise HTTPException(422,detail={"message":"Отчёт не готов","errors":errors})
-        subject=s.get(Subject,r.subject_id);folder=DATA/"exports";folder.mkdir(exist_ok=True);path=folder/f"Практическая работа №{r.work_number}.odt"
+        subject=s.get(Subject,r.subject_id);folder=DATA/"exports";folder.mkdir(exist_ok=True);path=folder/f"{r.id}.odt"
         export_report_to_odt(r,subject,path)
-        return FileResponse(path,filename=path.name,media_type="application/vnd.oasis.opendocument.text")
+        return FileResponse(path,filename=f"Практическая работа №{r.work_number}.odt",media_type="application/vnd.oasis.opendocument.text")
 
 @app.get("/api/profile")
 def profile():
     with Session(DB) as s:
-        p=s.get(Profile,1)
+        p=s.scalar(select(Profile).where(Profile.owner_id==owner_id()))
+        if not p:
+            p=Profile(owner_id=owner_id());s.add(p);s.commit()
         return {"student":p.student,"specialty":p.specialty,"group_name":p.group_name,"teacher":p.teacher,"city":p.city}
 @app.patch("/api/profile")
 def patch_profile(data:dict[str,str]):
     with Session(DB) as s:
-        p=s.get(Profile,1)
+        p=s.scalar(select(Profile).where(Profile.owner_id==owner_id()))
+        if not p:
+            p=Profile(owner_id=owner_id());s.add(p)
         for key in ("student","specialty","group_name","teacher","city"):
             if key in data:setattr(p,key,data[key].strip())
         s.commit();return {"student":p.student,"specialty":p.specialty,"group_name":p.group_name,"teacher":p.teacher,"city":p.city}
@@ -509,3 +664,18 @@ def frontend_app(path: str):
     index=root/"index.html"
     if index.is_file():return FileResponse(index)
     raise HTTPException(status_code=404)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Управление учетными записями")
+    parser.add_argument("command", choices=["create-user"])
+    parser.add_argument("login")
+    args = parser.parse_args()
+    first = getpass("Пароль (минимум 8 символов): ")
+    second = getpass("Повторите пароль: ")
+    if first != second:
+        raise SystemExit("Пароли не совпадают")
+    try:
+        register_user(args.login, first)
+        print(f"Учетная запись {args.login.strip()} создана")
+    except ValueError as exc:
+        raise SystemExit(str(exc))
