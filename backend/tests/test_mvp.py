@@ -29,6 +29,16 @@ def png(color,size=(1920,1080)):
     im=Image.new("RGB",size,color)
     b=io.BytesIO();im.save(b,format="PNG");return b.getvalue()
 
+def test_second_user_can_create_own_profile(client):
+    main.register_user("second-user", "test-password-456")
+    with TestClient(app) as second_client:
+        response=second_client.post('/api/auth/login',json={"login":"second-user","password":"test-password-456"})
+        assert response.status_code==200
+        profile=second_client.get('/api/profile')
+        assert profile.status_code==200
+        assert profile.json()=={"student":"","specialty":"","group_name":"","teacher":"","city":""}
+    assert client.get('/api/profile').json()["student"]=="Студент тестовый"
+
 def test_end_to_end_export_and_figure_order(client):
     sid=client.get('/api/subjects').json()[0]['id']
     r=client.post('/api/reports').json();rid=r['id'];tid=r['tasks'][0]['id'];step1=r['tasks'][0]['steps'][0]['id']
