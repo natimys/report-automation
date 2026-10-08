@@ -18,7 +18,11 @@ def client(tmp_path,monkeypatch):
     with Session(test_db) as s:
         s.add(Subject(name="Тестовый предмет",teacher="Преподаватель тестовый"))
         s.add(Profile(id=1,student="Студент тестовый",specialty="Тестовая специальность",group_name="ТЕСТ-1",city="Город тестовый"));s.commit()
-    with TestClient(app) as test_client:yield test_client
+    main.register_user("test-user", "test-password-123")
+    with TestClient(app) as test_client:
+        response=test_client.post('/api/auth/login',json={"login":"test-user","password":"test-password-123"})
+        assert response.status_code==200
+        yield test_client
     test_db.dispose()
 
 def png(color,size=(1920,1080)):
