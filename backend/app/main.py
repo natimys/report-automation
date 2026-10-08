@@ -53,7 +53,7 @@ class Subject(Base):
 
 class Profile(Base):
     __tablename__ = "profile"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     student: Mapped[str] = mapped_column(String, default="")
     specialty: Mapped[str] = mapped_column(String, default="")
     group_name: Mapped[str] = mapped_column(String, default="")
